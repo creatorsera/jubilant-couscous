@@ -781,6 +781,17 @@ def scrape_one_site(root_url, cfg, skip_t1, respect_robots, log_cb):
             pages_done += 1
 
     total_time = round(time.time() - t_start, 1)
+
+    # ── Auto Facebook scraping (if enabled in settings) ──
+    if st.session_state.get("scrape_fb", False) and all_fb:
+        primary_fb = sorted(all_fb)[0]
+        log_cb(("info", f"Auto-scraping Facebook: {primary_fb}", None, None), "info")
+        fb_emails = scrape_facebook_page(primary_fb, log_cb)
+        new_fb_e  = fb_emails - all_emails
+        all_emails.update(fb_emails)
+        for e in sort_by_tier(new_fb_e):
+            log_cb(("email", e, primary_fb, tier_label(e)), "email")
+
     sorted_emails = sort_by_tier(all_emails)
     best = pick_best(all_emails)
 
@@ -853,70 +864,95 @@ st.markdown("""
 # ─────────────────────────────────────────
 #  SETTINGS PANEL (inline, no sidebar)
 # ─────────────────────────────────────────
-with st.expander("⚙️  Settings", expanded=True):
-    col_mode, col_extract, col_tiers, col_dedup = st.columns([2, 2, 2.5, 2])
+# ─────────────────────────────────────────
+#  SETTINGS PANEL — clean custom card, no expander
+# ─────────────────────────────────────────
+st.markdown("""
+<div style="background:#fff;border:1.5px solid #ebebeb;border-radius:18px;
+            padding:20px 24px 4px;margin-bottom:16px;">
+  <div style="font-size:10px;font-weight:700;letter-spacing:1.2px;
+              text-transform:uppercase;color:#bbb;margin-bottom:16px;">Settings</div>
+""", unsafe_allow_html=True)
 
-    with col_mode:
-        st.markdown('<span class="sg-label">Scraping Mode</span>', unsafe_allow_html=True)
-        mode_options = ["Easy", "Medium", "Extreme"]
-        mode_icons   = {"Easy":"🟢","Medium":"🟡","Extreme":"🔴"}
-        mode_descs   = {"Easy":"Homepage only","Medium":"Crawl site links","Extreme":"Sitemap + deep"}
-        for m in mode_options:
-            active_cls = f"active-{m.lower()}" if st.session_state.mode == m else ""
-            st.markdown(f'<div style="margin-bottom:4px"></div>', unsafe_allow_html=True)
-            if st.button(f"{mode_icons[m]}  {m} — {mode_descs[m]}",
-                         key=f"mode_{m}",
-                         type="primary" if st.session_state.mode == m else "secondary",
-                         use_container_width=True):
-                st.session_state.mode = m
-                st.rerun()
+# ── ROW 1: Mode + Toggles + Tiers side by side ──
+r1c1, r1c2, r1c3, r1c4 = st.columns([1.6, 1.8, 1.8, 1.8])
 
-    with col_extract:
-        st.markdown('<span class="sg-label">Extraction</span>', unsafe_allow_html=True)
-        st.session_state.single_mode = st.toggle(
-            "Best email per site only",
-            value=st.session_state.single_mode,
-            help="ON = one best email per domain. OFF = all valid emails grouped.",
-        )
-        st.session_state.skip_t1 = st.toggle(
-            "Skip site once Tier 1 found",
-            value=st.session_state.skip_t1,
-            help="Stops crawling as soon as editor/admin/press/contact email is found.",
-        )
-        st.session_state.respect_robots = st.toggle(
-            "Respect robots.txt",
-            value=st.session_state.respect_robots,
-            help="Honor each site's robots.txt rules. Polite but may miss some pages. Off by default.",
-        )
-        st.caption("All modes auto-scrape /contact, /about & write-for-us pages.")
+with r1c1:
+    st.markdown('<span style="font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#bbb;">Mode</span>', unsafe_allow_html=True)
+    mode_icons = {"Easy": "🟢", "Medium": "🟡", "Extreme": "🔴"}
+    mode_descs = {"Easy": "Homepage only", "Medium": "Crawl links", "Extreme": "Sitemap + deep"}
+    for m in ["Easy", "Medium", "Extreme"]:
+        is_active = st.session_state.mode == m
+        if st.button(
+            f"{mode_icons[m]}  {m}  —  {mode_descs[m]}",
+            key=f"mode_{m}",
+            type="primary" if is_active else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state.mode = m
+            st.rerun()
 
-    with col_tiers:
-        st.markdown('<span class="sg-label">Tier Filters</span>', unsafe_allow_html=True)
-        st.session_state.f_tier1 = st.checkbox("🥇 Tier 1 — editor / admin / press",  value=st.session_state.f_tier1)
-        st.session_state.f_tier2 = st.checkbox("🥈 Tier 2 — info / sales / support",  value=st.session_state.f_tier2)
-        st.session_state.f_tier3 = st.checkbox("🥉 Tier 3 — other valid emails",       value=st.session_state.f_tier3)
+with r1c2:
+    st.markdown('<span style="font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#bbb;">Behaviour</span>', unsafe_allow_html=True)
+    st.session_state.single_mode = st.toggle(
+        "Best email per site only",
+        value=st.session_state.single_mode,
+        help="Picks the single best email per domain using tier priority.",
+    )
+    st.session_state.skip_t1 = st.toggle(
+        "Skip site once Tier 1 found",
+        value=st.session_state.skip_t1,
+        help="Stops crawling as soon as a top-tier contact email is found.",
+    )
+    st.session_state.respect_robots = st.toggle(
+        "Respect robots.txt",
+        value=st.session_state.respect_robots,
+        help="Honour the site's robots.txt disallow rules. Polite but may miss pages.",
+    )
 
-    with col_dedup:
-        st.markdown('<span class="sg-label">Parameters & Memory</span>', unsafe_allow_html=True)
-        mode_key = st.session_state.mode
-        cfg = {
-            "Easy":    {"max_pages": 1,   "max_depth": 0, "sitemap": False, "delay": 0.3},
-            "Medium":  {"max_pages": 50,  "max_depth": 3, "sitemap": False, "delay": 0.5},
-            "Extreme": {"max_pages": 300, "max_depth": 6, "sitemap": True,  "delay": 0.3},
-        }[mode_key].copy()
+with r1c3:
+    st.markdown('<span style="font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#bbb;">Extra Sources</span>', unsafe_allow_html=True)
+    st.session_state.scrape_fb = st.toggle(
+        "Scrape linked Facebook page",
+        value=st.session_state.get("scrape_fb", False),
+        help="After crawling the site, automatically fetch the Facebook page it links to and extract any emails from it.",
+    )
+    st.caption("Also: /contact, /about & write-for-us pages are always scraped regardless of mode.")
 
+with r1c4:
+    st.markdown('<span style="font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#bbb;">Tier Filters</span>', unsafe_allow_html=True)
+    st.session_state.f_tier1 = st.checkbox("🥇 Tier 1  —  editor / admin / press",  value=st.session_state.f_tier1)
+    st.session_state.f_tier2 = st.checkbox("🥈 Tier 2  —  info / sales / support",   value=st.session_state.f_tier2)
+    st.session_state.f_tier3 = st.checkbox("🥉 Tier 3  —  other valid emails",        value=st.session_state.f_tier3)
+
+# ── ROW 2: Parameters + Dedup (only when relevant) ──
+mode_key = st.session_state.mode
+cfg = {
+    "Easy":    {"max_pages": 1,   "max_depth": 0, "sitemap": False, "delay": 0.3},
+    "Medium":  {"max_pages": 50,  "max_depth": 3, "sitemap": False, "delay": 0.5},
+    "Extreme": {"max_pages": 300, "max_depth": 6, "sitemap": True,  "delay": 0.3},
+}[mode_key].copy()
+
+if mode_key in ("Medium", "Extreme"):
+    st.markdown('<hr style="border:none;border-top:1px solid #f0f0f0;margin:4px 0 12px"/>', unsafe_allow_html=True)
+    p1, p2, p3 = st.columns([2, 2, 3])
+    with p1:
         if mode_key == "Medium":
-            cfg["max_depth"] = st.slider("Crawl depth",        1, 5, 3, key="depth_s")
+            cfg["max_depth"] = st.slider("Crawl depth", 1, 5, 3, key="depth_s")
+    with p2:
+        if mode_key == "Medium":
             cfg["max_pages"] = st.slider("Max pages per site", 10, 200, 50, key="pages_s")
         elif mode_key == "Extreme":
             cfg["max_pages"] = st.slider("Max pages per site", 50, 500, 300, key="pages_x")
-
+    with p3:
         n_dedup = len(st.session_state.scraped_domains)
-        st.markdown(f'<div style="margin-top:8px"></div>', unsafe_allow_html=True)
-        st.caption(f"{n_dedup} domain(s) in memory — won't be re-scraped.")
-        if n_dedup and st.button("Clear domain memory", type="secondary", use_container_width=True):
-            st.session_state.scraped_domains = set()
-            st.rerun()
+        st.caption(f"{n_dedup} domain(s) in memory — already scraped domains are skipped automatically.")
+        if n_dedup:
+            if st.button("Clear domain memory", type="secondary"):
+                st.session_state.scraped_domains = set()
+                st.rerun()
+
+st.markdown("</div>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────
 #  STATUS CHIPS
@@ -925,6 +961,7 @@ mode_key       = st.session_state.mode
 single_m       = st.session_state.single_mode
 skip_t1        = st.session_state.skip_t1
 respect_robots = st.session_state.respect_robots
+scrape_fb      = st.session_state.get("scrape_fb", False)
 scan_state     = st.session_state.scan_state
 
 chip_cls   = {"Easy":"c-easy","Medium":"c-medium","Extreme":"c-extreme"}[mode_key]
@@ -938,8 +975,8 @@ st.markdown(f"""
   <span class="chip {chip_cls}">{chip_ico} {mode_key}</span>
   <span class="chip {'c-violet' if single_m else 'c-neutral'}">{'🎯 Best email' if single_m else '📋 All emails'}</span>
   <span class="chip {'c-violet' if skip_t1 else 'c-neutral'}">{'⚡ Skip on Tier 1' if skip_t1 else 'No early skip'}</span>
+  <span class="chip {'c-violet' if scrape_fb else 'c-neutral'}">{'🌍 FB auto-scrape on' if scrape_fb else 'FB: manual only'}</span>
   <span class="chip {'c-amber' if respect_robots else 'c-neutral'}">{'🤝 Respecting robots.txt' if respect_robots else 'Ignoring robots.txt'}</span>
-  <span class="chip c-neutral">✅ /contact, /about & write-for-us always scraped</span>
   {state_chip}
 </div>
 """, unsafe_allow_html=True)
