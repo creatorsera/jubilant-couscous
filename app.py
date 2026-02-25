@@ -10,6 +10,13 @@ from collections import deque
 from datetime import datetime
 import random
 import pandas as pd
+import urllib.robotparser
+
+try:
+    import dns.resolver as _dns_resolver
+    DNS_AVAILABLE = True
+except ImportError:
+    DNS_AVAILABLE = False
 
 st.set_page_config(
     page_title="MailHunter",
@@ -454,8 +461,8 @@ for k, v in {
     "mode":            "Easy",
     "single_mode":     False,
     "skip_t1":         True,
-    "scrape_fb":       False,
-    "scrape_fb":       False,
+    "respect_robots":  False,
+    "mx_cache":        {},      # domain → True/False/None(unknown)
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -557,7 +564,48 @@ def get_internal_links(html, base_url, root_domain):
             links.append(full.split("#")[0].split("?")[0])
     return list(set(links))
 
-def find_write_for_us_links(html, base_url, root_domain):
+def check_mx(email: str) -> bool | None:
+    """
+    Check if the email's domain has a valid MX record.
+    Returns True (has MX), False (no MX = likely fake), None (dns unavailable / timeout).
+    Results are cached in session state to avoid repeat lookups.
+    """
+    if not DNS_AVAILABLE:
+        return None
+    domain = email.split("@")[1].lower()
+    cache  = st.session_state.mx_cache
+    if domain in cache:
+        return cache[domain]
+    try:
+        records = _dns_resolver.resolve(domain, "MX", lifetime=4)
+        result  = len(records) > 0
+    except Exception:
+        result = False
+    cache[domain] = result
+    return result
+
+
+def load_robots(root_url: str, respect: bool):
+    """Return a RobotFileParser for root_url, or None if respect=False."""
+    if not respect:
+        return None
+    rp  = urllib.robotparser.RobotFileParser()
+    rp.set_url(root_url.rstrip("/") + "/robots.txt")
+    try:
+        rp.read()
+    except Exception:
+        pass
+    return rp
+
+
+def robots_allowed(rp, url: str) -> bool:
+    """Return True if we're allowed to fetch url (or if rp is None = ignore robots)."""
+    if rp is None:
+        return True
+    try:
+        return rp.can_fetch("*", url)
+    except Exception:
+        return True
     """
     Scan any page for links whose text or href contains write-for-us keywords.
     Returns a list of internal URLs to add to the priority queue.
@@ -633,7 +681,7 @@ def fetch_sitemap_urls(root_url):
         if urls: break
     return urls
 
-def scrape_one_site(root_url, cfg, skip_t1, log_cb):
+def scrape_one_site(root_url, cfg, skip_t1, respect_robots, log_cb):
     """Scrape a site, calling log_cb with rich per-page events."""
     t_start     = time.time()
     parsed      = urlparse(root_url)
@@ -644,6 +692,12 @@ def scrape_one_site(root_url, cfg, skip_t1, log_cb):
     all_tw, all_li, all_fb = set(), set(), set()
 
     base = root_url.rstrip("/")
+
+    # Load robots.txt once per site
+    rp = load_robots(root_url, respect_robots)
+    if rp and respect_robots:
+        log_cb(("info", f"robots.txt loaded for {root_domain}", None, None), "info")
+
     for path in PRIORITY_PATHS:
         queue.append((base + path, 0, True))
     queue.append((root_url, 0, False))
@@ -667,6 +721,13 @@ def scrape_one_site(root_url, cfg, skip_t1, log_cb):
         label    = "priority" if is_priority else f"{pages_done+1}/{max_pages}"
         short    = url.replace("https://","").replace("http://","")
         t_page   = time.time()
+
+        # Robots.txt check
+        if not robots_allowed(rp, url):
+            log_cb(("timing", f"robots.txt blocked — skipping {short}", url, None), "timing")
+            if not is_priority:
+                pages_done += 1
+            continue
 
         log_cb(("page_start", short, label, None), "active")
 
@@ -819,6 +880,11 @@ with st.expander("⚙️  Settings", expanded=True):
             value=st.session_state.skip_t1,
             help="Stops crawling as soon as editor/admin/press/contact email is found.",
         )
+        st.session_state.respect_robots = st.toggle(
+            "Respect robots.txt",
+            value=st.session_state.respect_robots,
+            help="Honor each site's robots.txt rules. Polite but may miss some pages. Off by default.",
+        )
         st.caption("All modes auto-scrape /contact, /about & write-for-us pages.")
 
     with col_tiers:
@@ -852,13 +918,12 @@ with st.expander("⚙️  Settings", expanded=True):
 # ─────────────────────────────────────────
 #  STATUS CHIPS
 # ─────────────────────────────────────────
-mode_key   = st.session_state.mode
-single_m   = st.session_state.single_mode
-skip_t1    = st.session_state.skip_t1
-scrape_fb  = st.session_state.scrape_fb
-scan_state = st.session_state.scan_state
+mode_key       = st.session_state.mode
+single_m       = st.session_state.single_mode
+skip_t1        = st.session_state.skip_t1
+respect_robots = st.session_state.respect_robots
+scan_state     = st.session_state.scan_state
 
-scrape_fb  = st.session_state.get("scrape_fb", False)
 chip_cls   = {"Easy":"c-easy","Medium":"c-medium","Extreme":"c-extreme"}[mode_key]
 chip_ico   = {"Easy":"🟢","Medium":"🟡","Extreme":"🔴"}[mode_key]
 state_chip = {"idle":"","running":'<span class="chip c-violet">● Running</span>',
@@ -870,6 +935,7 @@ st.markdown(f"""
   <span class="chip {chip_cls}">{chip_ico} {mode_key}</span>
   <span class="chip {'c-violet' if single_m else 'c-neutral'}">{'🎯 Best email' if single_m else '📋 All emails'}</span>
   <span class="chip {'c-violet' if skip_t1 else 'c-neutral'}">{'⚡ Skip on Tier 1' if skip_t1 else 'No early skip'}</span>
+  <span class="chip {'c-amber' if respect_robots else 'c-neutral'}">{'🤝 Respecting robots.txt' if respect_robots else 'Ignoring robots.txt'}</span>
   <span class="chip c-neutral">✅ /contact, /about & write-for-us always scraped</span>
   {state_chip}
 </div>
@@ -1055,7 +1121,7 @@ if st.session_state.scan_state == "running":
             ("site", domain_short, None, None), "site"))
 
         log_cb = log_cb_factory(log_ph)
-        row    = scrape_one_site(url, cfg, skip_t1, log_cb)
+        row    = scrape_one_site(url, cfg, skip_t1, st.session_state.respect_robots, log_cb)
 
         # store
         st.session_state.results[row["Domain"]] = row
@@ -1121,6 +1187,7 @@ if st.session_state.results:
     for domain, r in results.items():
         all_e    = r.get("All Emails", [])
         fb_pages = r.get("Facebook", [])
+        mx_data  = r.get("MX", {})   # email → True/False/None
 
         if st.session_state.single_mode:
             disp_emails = r.get("Best Email","") or "—"
@@ -1128,64 +1195,130 @@ if st.session_state.results:
             filtered    = [e for e in all_e if tier_key(e) in tier_filter]
             disp_emails = " | ".join(filtered) if filtered else "—"
 
-        # Row card
+        # MX badge rendering
+        def mx_badge(e):
+            v = mx_data.get(e)
+            if v is True:  return ' <span style="color:#16a34a;font-size:10px">✓ MX</span>'
+            if v is False: return ' <span style="color:#e11d48;font-size:10px">✗ no MX</span>'
+            return ""
+
+        if st.session_state.single_mode:
+            email_with_mx = disp_emails + (mx_badge(disp_emails) if disp_emails != "—" else "")
+            email_html    = email_with_mx
+        else:
+            email_html = " | ".join(
+                e + mx_badge(e) for e in (filtered if 'filtered' in dir() else all_e)
+            ) or "—"
+
         st.markdown(f"""
         <div style="background:#fff;border:1.5px solid #ebebeb;border-radius:14px;
                     padding:14px 18px;margin-bottom:8px;">
           <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-            <div>
+            <div style="flex:1;min-width:0">
               <div style="font-size:13px;font-weight:700;color:#1a1a1a">{domain}</div>
-              <div style="font-size:12px;color:#5b5bd6;margin-top:3px;font-family:'DM Mono',monospace;word-break:break-all">{disp_emails}</div>
+              <div style="font-size:12px;color:#5b5bd6;margin-top:4px;font-family:'DM Mono',monospace;
+                          word-break:break-all;line-height:1.8">{email_html if email_html else disp_emails}</div>
             </div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;flex-shrink:0">
               {"".join(f'<span style="font-size:11px;color:#aaa">{h}</span>' for h in r.get("Twitter",[])[:2])}
               {"".join(f'<span style="font-size:11px;color:#3b5998">{f}</span>' for f in fb_pages[:1])}
-              <span style="font-size:11px;color:#aaa">{r.get("Pages Scraped",0)} pages · {r.get("Total Time","?")}s</span>
+              <span style="font-size:11px;color:#ccc">{r.get("Pages Scraped",0)}p · {r.get("Total Time","?")}s</span>
             </div>
           </div>
         </div>""", unsafe_allow_html=True)
 
-        # Facebook scrape button — only show if a FB page was found
+        # Action buttons row (FB + MX) — shown when relevant
+        btn_col1, btn_col2, _ = st.columns([2, 2, 4])
+
+        # Facebook button
         if fb_pages:
-            primary_fb = fb_pages[0]   # only the first / main page linked from the site
-            fb_btn_key = f"fb_{domain}"
-            fb_col, _ = st.columns([2, 5])
-            with fb_col:
-                if st.button(f"Scrape Facebook — {primary_fb.replace('facebook.com/','')[:28]}",
-                             key=fb_btn_key, type="secondary", use_container_width=True):
+            primary_fb = fb_pages[0]
+            with btn_col1:
+                if st.button(f"Scrape Facebook",
+                             key=f"fb_{domain}", type="secondary", use_container_width=True):
                     st.session_state[f"fb_run_{domain}"] = True
                     st.rerun()
 
-            # Run if button was clicked
-            if st.session_state.get(f"fb_run_{domain}"):
-                st.session_state[f"fb_run_{domain}"] = False
-                fb_log_ph = st.empty()
-                fb_lines  = []
+        # MX verify button — shown when there are emails and dnspython is installed
+        if all_e:
+            with btn_col2:
+                already_verified = len(mx_data) > 0
+                btn_label = "Re-verify MX" if already_verified else "Verify MX records"
+                if not DNS_AVAILABLE:
+                    st.caption("Install dnspython to enable MX verification")
+                elif st.button(btn_label, key=f"mx_{domain}", type="secondary", use_container_width=True):
+                    st.session_state[f"mx_run_{domain}"] = True
+                    st.rerun()
 
-                def fb_log(item, kind):
-                    fb_lines.append((item, kind))
-                    lines_html = ""
-                    for itm, knd in fb_lines[-20:]:
-                        ev, txt, pg, ex = itm
-                        if knd == "active":  lines_html += f'<div class="ll-page">[facebook] {txt}</div>'
-                        elif knd == "email": lines_html += f'<div class="ll-email">{txt}</div>'
-                        elif knd == "timing":lines_html += f'<div class="ll-timing">{txt}</div>'
-                        else:                lines_html += f'<div class="ll-done">{txt}</div>'
-                    fb_log_ph.markdown(f'<div class="log-wrap"><div class="log-header"><span class="log-header-title">Facebook Log</span></div><div class="log-body">{lines_html}</div></div>',
-                                       unsafe_allow_html=True)
+        # Run Facebook scrape
+        if st.session_state.get(f"fb_run_{domain}") and fb_pages:
+            st.session_state[f"fb_run_{domain}"] = False
+            primary_fb = fb_pages[0]
+            fb_log_ph  = st.empty()
+            fb_lines   = []
 
-                fb_emails = scrape_facebook_page(primary_fb, fb_log)
-                if fb_emails:
-                    new_fb_e = fb_emails - set(r.get("All Emails",[]))
-                    updated  = sort_by_tier(set(r.get("All Emails",[])) | fb_emails)
-                    st.session_state.results[domain]["All Emails"] = updated
-                    best = pick_best(set(updated))
-                    st.session_state.results[domain]["Best Email"] = best or ""
-                    fb_log(("done", f"Added {len(new_fb_e)} new email(s) from Facebook", None, None), "done")
-                else:
-                    fb_log(("done", "No emails found — Facebook likely blocked the request", None, None), "done")
-                time.sleep(0.5)
-                st.rerun()
+            def fb_log(item, kind):
+                fb_lines.append((item, kind))
+                lines_html = ""
+                for itm, knd in fb_lines[-20:]:
+                    ev, txt, pg, ex = itm
+                    if knd == "active":   lines_html += f'<div class="ll-page">[facebook] {txt}</div>'
+                    elif knd == "email":  lines_html += f'<div class="ll-email">{txt}</div>'
+                    elif knd == "timing": lines_html += f'<div class="ll-timing">{txt}</div>'
+                    else:                 lines_html += f'<div class="ll-done">{txt}</div>'
+                fb_log_ph.markdown(
+                    f'<div class="log-wrap"><div class="log-header">'
+                    f'<span class="log-header-title">Facebook — {primary_fb}</span>'
+                    f'</div><div class="log-body">{lines_html}</div></div>',
+                    unsafe_allow_html=True)
+
+            fb_emails = scrape_facebook_page(primary_fb, fb_log)
+            if fb_emails:
+                updated = sort_by_tier(set(r.get("All Emails",[])) | fb_emails)
+                st.session_state.results[domain]["All Emails"] = updated
+                best = pick_best(set(updated))
+                st.session_state.results[domain]["Best Email"] = best or ""
+                fb_log(("done", f"{len(fb_emails)} email(s) merged into results", None, None), "done")
+            else:
+                fb_log(("done", "No emails found — Facebook likely blocked the request", None, None), "done")
+            time.sleep(0.5)
+            st.rerun()
+
+        # Run MX verification
+        if st.session_state.get(f"mx_run_{domain}") and DNS_AVAILABLE:
+            st.session_state[f"mx_run_{domain}"] = False
+            mx_ph = st.empty()
+            mx_log_lines = []
+
+            def mx_log(msg, good):
+                mx_log_lines.append((msg, good))
+                rows_html = "".join(
+                    f'<div class="{"ll-email" if g else "ll-skip"}">{m}</div>'
+                    for m, g in mx_log_lines[-30:]
+                )
+                mx_ph.markdown(
+                    f'<div class="log-wrap"><div class="log-header">'
+                    f'<span class="log-header-title">MX Verification — {domain}</span>'
+                    f'<span class="log-header-stat">{sum(g for _,g in mx_log_lines)} / {len(mx_log_lines)} valid</span>'
+                    f'</div><div class="log-body">{rows_html}</div></div>',
+                    unsafe_allow_html=True)
+
+            new_mx = {}
+            for email in all_e:
+                result = check_mx(email)
+                new_mx[email] = result
+                label = f"✓ {email}" if result else f"✗ {email} — no MX record"
+                mx_log(label, result if result is not None else False)
+
+            st.session_state.results[domain]["MX"] = new_mx
+            # Remove emails with no MX from All Emails
+            valid_only = [e for e in all_e if new_mx.get(e) is not False]
+            if len(valid_only) < len(all_e):
+                removed = len(all_e) - len(valid_only)
+                st.session_state.results[domain]["All Emails"] = valid_only
+                mx_log(f"Removed {removed} email(s) with no MX record", True)
+            time.sleep(0.3)
+            st.rerun()
 
     # ── TABLE VIEW (collapsible) ──
     with st.expander("View as table"):
