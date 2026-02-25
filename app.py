@@ -606,6 +606,9 @@ def robots_allowed(rp, url: str) -> bool:
         return rp.can_fetch("*", url)
     except Exception:
         return True
+
+
+def find_write_for_us_links(html, base_url, root_domain):
     """
     Scan any page for links whose text or href contains write-for-us keywords.
     Returns a list of internal URLs to add to the priority queue.
@@ -623,12 +626,12 @@ def robots_allowed(rp, url: str) -> bool:
     soup  = BeautifulSoup(html, "html.parser")
     found = []
     for a in soup.find_all("a", href=True):
-        href    = a.get("href","")
-        text    = (a.get_text(" ", strip=True) + " " + href).lower()
+        href = a.get("href", "")
+        text = (a.get_text(" ", strip=True) + " " + href).lower()
         if any(kw in text for kw in WRITE_KEYWORDS):
             full = urljoin(base_url, href)
             p    = urlparse(full)
-            if p.netloc == root_domain and p.scheme in ("http","https"):
+            if p.netloc == root_domain and p.scheme in ("http", "https"):
                 found.append(full.split("#")[0].split("?")[0])
     return list(set(found))
 
