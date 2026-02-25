@@ -1,7 +1,0 @@
-import urllib.robotparser
-
-rp = urllib.robotparser.RobotFileParser()
-rp.set_url("https://magazine.com/robots.txt")
-rp.read()  # fetches and parses it
-
-rp.can_fetch("*", "https://magazine.com/contact")  # True or False
