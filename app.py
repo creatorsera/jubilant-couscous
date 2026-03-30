@@ -3,6 +3,10 @@ import requests
 from bs4 import BeautifulSoup
 import re, io, time, xml.etree.ElementTree as ET, random, pandas as pd
 import urllib.robotparser, smtplib, threading
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import DataBarRule, ColorScaleRule
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 from email_validator import validate_email as ev_validate, EmailNotValidError
@@ -697,6 +701,296 @@ def render_log(ph):
         elif kind=="warn":   h+=f'<div class="ll-warn">  !! {t}</div>'
     ph.markdown(f'<div class="log-box">{h}</div>', unsafe_allow_html=True)
 
+def build_xlsx(results):
+    """
+    Build a polished 3-sheet Excel workbook from scraper results.
+
+    Sheet 1 — Results  (colored by deliverability status)
+    Sheet 2 — All Emails  (one row per email, all domains expanded)
+    Sheet 3 — Stats  (summary counts with a mini bar chart feel)
+    """
+    wb = Workbook()
+
+    # ── palette ──────────────────────────────────────────────────────────
+    BLACK   = "111111"
+    WHITE   = "FFFFFF"
+    # deliverability row fills
+    F_DELIV   = PatternFill("solid", fgColor="F0FDF4")   # pale green
+    F_RISKY   = PatternFill("solid", fgColor="FFFBEB")   # pale amber
+    F_BAD     = PatternFill("solid", fgColor="FFF1F2")   # pale red
+    F_NONE    = PatternFill("solid", fgColor="F9FAFB")   # pale grey
+    # email cell accent fills
+    A_DELIV   = PatternFill("solid", fgColor="DCFCE7")   # green
+    A_RISKY   = PatternFill("solid", fgColor="FEF3C7")   # amber
+    A_BAD     = PatternFill("solid", fgColor="FECACA")   # red
+    A_FALLBK  = PatternFill("solid", fgColor="E0F2FE")   # sky blue — fallback email
+    # tier fills
+    T_T1      = PatternFill("solid", fgColor="FEF9C3")   # gold tint
+    T_T2      = PatternFill("solid", fgColor="EEF2FF")   # indigo tint
+    T_T3      = PatternFill("solid", fgColor="F1F5F9")   # slate tint
+    # confidence fills
+    C_HIGH    = PatternFill("solid", fgColor="D1FAE5")   # green
+    C_MID     = PatternFill("solid", fgColor="FEF3C7")   # amber
+    C_LOW     = PatternFill("solid", fgColor="FEE2E2")   # red
+    # header
+    HDR_FILL  = PatternFill("solid", fgColor=BLACK)
+    HDR_FONT  = Font(bold=True, color=WHITE, size=10, name="Calibri")
+    HDR_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    thin = Side(style="thin", color="E5E7EB")
+    BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def hdr_cell(ws, row, col, value, width=None):
+        c = ws.cell(row=row, column=col, value=value)
+        c.fill = HDR_FILL; c.font = HDR_FONT; c.alignment = HDR_ALIGN
+        c.border = BORDER
+        if width: ws.column_dimensions[get_column_letter(col)].width = width
+        return c
+
+    def body_cell(ws, row, col, value, fill=None, font=None, align=None):
+        c = ws.cell(row=row, column=col, value=value)
+        if fill:  c.fill  = fill
+        if font:  c.font  = font
+        if align: c.alignment = align
+        c.border = BORDER
+        return c
+
+    def row_fill_for(status):
+        if status == "Deliverable":    return F_DELIV
+        if status == "Risky":          return F_RISKY
+        if status == "Not Deliverable":return F_BAD
+        return F_NONE
+
+    def email_fill_for(status, was_fallback):
+        if was_fallback:               return A_FALLBK
+        if status == "Deliverable":    return A_DELIV
+        if status == "Risky":          return A_RISKY
+        if status == "Not Deliverable":return A_BAD
+        return None
+
+    def tier_fill_for(tier):
+        if "Tier 1" in tier: return T_T1
+        if "Tier 2" in tier: return T_T2
+        return T_T3
+
+    def conf_fill_for(score):
+        if score is None: return None
+        if score >= 75: return C_HIGH
+        if score >= 45: return C_MID
+        return C_LOW
+
+    NORMAL_FONT = Font(size=10, name="Calibri")
+    BOLD_FONT   = Font(size=10, name="Calibri", bold=True)
+    MONO_FONT   = Font(size=9,  name="Courier New")
+    CENTER      = Alignment(horizontal="center", vertical="center")
+    LEFT        = Alignment(horizontal="left",   vertical="center")
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  SHEET 1 — Results
+    # ══════════════════════════════════════════════════════════════════════
+    ws1 = wb.active
+    ws1.title = "Results"
+    ws1.freeze_panes = "A2"
+    ws1.row_dimensions[1].height = 28
+
+    COLS1 = [
+        ("#",         4),  ("Domain",     22), ("Best Email",    28),
+        ("Tier",      9),  ("Status",     14), ("Confidence",    11),
+        ("Reason",   22),  ("SPF",         6), ("DMARC",          7),
+        ("Catch-All", 9),  ("Fallback?",  10), ("Twitter",       18),
+        ("LinkedIn",  22), ("All Emails", 40), ("Pages",          7),
+        ("Time (s)", 10),  ("Source URL", 30),
+    ]
+    for ci, (name, width) in enumerate(COLS1, 1):
+        hdr_cell(ws1, 1, ci, name, width)
+
+    for ri, (domain, r) in enumerate(results.items(), 2):
+        val     = r.get("Validation", {}) or {}
+        status  = val.get("status", "")
+        was_fb  = r.get("WasFallback", False)
+        vbest   = r.get("ValidatedBestEmail", "") or r.get("Best Email", "")
+        tier    = r.get("Best Tier", "")
+        conf    = r.get("Confidence")
+        r_fill  = row_fill_for(status)
+        e_fill  = email_fill_for(status, was_fb)
+        t_fill  = tier_fill_for(tier) if tier else None
+        c_fill  = conf_fill_for(conf)
+        ws1.row_dimensions[ri].height = 18
+
+        def bc(col, value, fill_override=None, font_override=None, align_override=None):
+            fill_ = fill_override if fill_override is not None else r_fill
+            font_ = font_override or NORMAL_FONT
+            aln_  = align_override or LEFT
+            return body_cell(ws1, ri, col, value, fill_, font_, aln_)
+
+        bc(1,  ri-1,      align_override=CENTER)
+        bc(2,  domain,    font_override=BOLD_FONT)
+        body_cell(ws1, ri, 3, vbest, e_fill or r_fill, MONO_FONT, LEFT)
+        body_cell(ws1, ri, 4, tier,  t_fill or r_fill, NORMAL_FONT, CENTER)
+        # status cell — strong color even without row fill
+        status_fill = {"Deliverable": PatternFill("solid", fgColor="16A34A"),
+                       "Risky":       PatternFill("solid", fgColor="D97706"),
+                       "Not Deliverable": PatternFill("solid", fgColor="DC2626"),
+                      }.get(status)
+        status_font = Font(size=10, name="Calibri", bold=True,
+                           color=WHITE if status else BLACK)
+        body_cell(ws1, ri, 5, status or "—", status_fill or r_fill, status_font, CENTER)
+        body_cell(ws1, ri, 6, conf if conf is not None else "—", c_fill or r_fill,
+                  Font(size=10, name="Calibri", bold=True), CENTER)
+        bc(7,  val.get("reason","—"))
+        bc(8,  "✓" if val.get("spf")   else "✗", align_override=CENTER,
+           font_override=Font(size=11, color="16A34A" if val.get("spf") else "DC2626"))
+        bc(9,  "✓" if val.get("dmarc") else "✗", align_override=CENTER,
+           font_override=Font(size=11, color="16A34A" if val.get("dmarc") else "DC2626"))
+        bc(10, "⚠" if val.get("catch_all") else "—", align_override=CENTER,
+           font_override=Font(size=11, color="D97706" if val.get("catch_all") else "999999"))
+        bc(11, "↻ Yes" if was_fb else "—", align_override=CENTER,
+           font_override=Font(size=10, color="0891B2" if was_fb else "999999",
+                              bold=was_fb, name="Calibri"))
+        bc(12, (r.get("Twitter",[])+[""])[0])
+        bc(13, (r.get("LinkedIn",[])+[""])[0])
+        bc(14, "; ".join(r.get("All Emails",[])),
+           font_override=Font(size=8, name="Courier New", color="555555"))
+        bc(15, r.get("Pages Scraped",0),   align_override=CENTER)
+        bc(16, r.get("Total Time",""),      align_override=CENTER)
+        bc(17, r.get("Source URL",""),
+           font_override=Font(size=9, color="2563EB", name="Calibri"))
+
+    # ── legend row at bottom ──
+    last_row = len(results) + 3
+    ws1.cell(row=last_row, column=1, value="Legend:").font = Font(bold=True, size=9, name="Calibri")
+    legends = [
+        (2, F_DELIV,  A_DELIV,  "Deliverable"),
+        (4, F_RISKY,  A_RISKY,  "Risky"),
+        (6, F_BAD,    A_BAD,    "Not Deliverable"),
+        (8, None,     A_FALLBK, "Fallback email used"),
+    ]
+    for col, row_f, cell_f, label in legends:
+        c = ws1.cell(row=last_row, column=col, value=label)
+        c.fill = cell_f or row_f
+        c.font = Font(size=9, name="Calibri")
+        c.alignment = CENTER
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  SHEET 2 — All Emails (expanded, one per row)
+    # ══════════════════════════════════════════════════════════════════════
+    ws2 = wb.create_sheet("All Emails")
+    ws2.freeze_panes = "A2"
+    ws2.row_dimensions[1].height = 28
+
+    COLS2 = [("Domain",20),("Email",30),("Tier",9),("Is Best?",9),("Is Validated Best?",18)]
+    for ci, (name, width) in enumerate(COLS2, 1):
+        hdr_cell(ws2, 1, ci, name, width)
+
+    row2 = 2
+    for domain, r in results.items():
+        best_e  = r.get("Best Email","")
+        vbest_e = r.get("ValidatedBestEmail","") or best_e
+        for email in r.get("All Emails",[]):
+            t = tier_key(email)
+            t_fill2 = {"1":T_T1,"2":T_T2,"3":T_T3}.get(t, F_NONE)
+            is_best   = email == best_e
+            is_vbest  = email == vbest_e
+            row_f2 = F_DELIV if is_vbest else (T_T1 if t=="1" else F_NONE)
+
+            body_cell(ws2, row2, 1, domain,    row_f2, BOLD_FONT if is_vbest else NORMAL_FONT, LEFT)
+            body_cell(ws2, row2, 2, email,     row_f2, MONO_FONT,    LEFT)
+            body_cell(ws2, row2, 3, tier_short(email), t_fill2, NORMAL_FONT, CENTER)
+            body_cell(ws2, row2, 4, "★" if is_best  else "",
+                      row_f2, Font(size=12, color="D97706"), CENTER)
+            body_cell(ws2, row2, 5, "✓" if is_vbest else "",
+                      row_f2, Font(size=12, color="16A34A", bold=True), CENTER)
+            ws2.row_dimensions[row2].height = 16
+            row2 += 1
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  SHEET 3 — Stats dashboard
+    # ══════════════════════════════════════════════════════════════════════
+    ws3 = wb.create_sheet("Stats")
+    ws3.column_dimensions["A"].width = 24
+    ws3.column_dimensions["B"].width = 12
+    ws3.column_dimensions["C"].width = 28
+
+    # big title
+    title = ws3.cell(row=1, column=1, value="MailHunter — Scan Summary")
+    title.font = Font(bold=True, size=16, name="Calibri", color=BLACK)
+    title.fill = PatternFill("solid", fgColor="F9FAFB")
+    ws3.merge_cells("A1:C1")
+    ws3.row_dimensions[1].height = 30
+    title.alignment = Alignment(horizontal="left", vertical="center")
+
+    ts_cell = ws3.cell(row=2, column=1,
+        value=f"Generated: {datetime.now().strftime('%d %b %Y %H:%M')}")
+    ts_cell.font = Font(size=9, color="999999", name="Calibri")
+    ws3.merge_cells("A2:C2")
+
+    # stat rows
+    stats = [
+        ("Total sites scanned",  len(results)),
+        ("Total emails found",   sum(len(r.get("All Emails",[])) for r in results.values())),
+        ("Tier 1 emails",        sum(1 for r in results.values() if r.get("Best Tier","").startswith("Tier 1"))),
+        ("Tier 2 emails",        sum(1 for r in results.values() if r.get("Best Tier","").startswith("Tier 2"))),
+        ("Tier 3 emails",        sum(1 for r in results.values() if r.get("Best Tier","").startswith("Tier 3"))),
+        ("Validated Deliverable",sum(1 for r in results.values() if (r.get("Validation",{}) or {}).get("status")=="Deliverable")),
+        ("Validated Risky",      sum(1 for r in results.values() if (r.get("Validation",{}) or {}).get("status")=="Risky")),
+        ("Not Deliverable",      sum(1 for r in results.values() if (r.get("Validation",{}) or {}).get("status")=="Not Deliverable")),
+        ("Fallback emails used", sum(1 for r in results.values() if r.get("WasFallback"))),
+        ("Sites with no email",  sum(1 for r in results.values() if not r.get("Best Email"))),
+        ("Avg confidence score", round(sum(r.get("Confidence",0) or 0 for r in results.values()
+                                          if r.get("Confidence") is not None) /
+                                       max(1, sum(1 for r in results.values() if r.get("Confidence") is not None)), 1)),
+    ]
+    stat_colors = {
+        "Total sites scanned":   ("F0F9FF","0C4A6E"),
+        "Total emails found":    ("F0F9FF","0C4A6E"),
+        "Tier 1 emails":         ("FEF9C3","78350F"),
+        "Tier 2 emails":         ("EEF2FF","3730A3"),
+        "Tier 3 emails":         ("F1F5F9","334155"),
+        "Validated Deliverable": ("F0FDF4","14532D"),
+        "Validated Risky":       ("FFFBEB","78350F"),
+        "Not Deliverable":       ("FFF1F2","881337"),
+        "Fallback emails used":  ("E0F2FE","0C4A6E"),
+        "Sites with no email":   ("F9FAFB","374151"),
+        "Avg confidence score":  ("F0FDF4","14532D"),
+    }
+
+    total = len(results) or 1
+    for i, (label, value) in enumerate(stats, 4):
+        bg, fg = stat_colors.get(label, ("F9FAFB","111111"))
+        lc = ws3.cell(row=i, column=1, value=label)
+        lc.font  = Font(size=10, name="Calibri", color=fg)
+        lc.fill  = PatternFill("solid", fgColor=bg)
+        lc.alignment = LEFT
+        lc.border = BORDER
+
+        vc = ws3.cell(row=i, column=2, value=value)
+        vc.font  = Font(size=11, name="Calibri", bold=True, color=fg)
+        vc.fill  = PatternFill("solid", fgColor=bg)
+        vc.alignment = CENTER
+        vc.border = BORDER
+        ws3.row_dimensions[i].height = 22
+
+        # mini bar in column C — proportional fill using unicode blocks
+        if isinstance(value, (int, float)) and label not in ("Avg confidence score",):
+            pct = min(value / total, 1.0)
+            bar_len = int(pct * 20)
+            bar_str = "█" * bar_len + "░" * (20 - bar_len) + f"  {round(pct*100)}%"
+            bc_ = ws3.cell(row=i, column=3, value=bar_str)
+            bc_.font  = Font(size=9, name="Courier New", color=fg)
+            bc_.fill  = PatternFill("solid", fgColor=bg)
+            bc_.alignment = LEFT
+            bc_.border = BORDER
+        else:
+            bc_ = ws3.cell(row=i, column=3, value="")
+            bc_.fill = PatternFill("solid", fgColor=bg)
+            bc_.border = BORDER
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
+
+
 fetch_disposable_domains()
 
 hc1, hc2 = st.columns([5,1])
@@ -708,27 +1002,14 @@ with hc1:
         unsafe_allow_html=True)
 with hc2:
     if st.session_state.results:
-        rows_csv = []
-        for d, r in st.session_state.results.items():
-            val = r.get("Validation",{}) or {}
-            rows_csv.append({
-                "Domain":d,"Best Email":r.get("Best Email",""),
-                "Validated Best":r.get("ValidatedBestEmail",""),
-                "Was Fallback":r.get("WasFallback",False),
-                "Deliverability":val.get("status",""),"Reason":val.get("reason",""),
-                "Confidence":r.get("Confidence",""),
-                "SPF":val.get("spf",""),"MX":val.get("mx",""),"DMARC":val.get("dmarc",""),
-                "Catch-All":val.get("catch_all",""),
-                "All Emails":"; ".join(r.get("All Emails",[])),
-                "Twitter":"; ".join(r.get("Twitter",[])),
-                "LinkedIn":"; ".join(r.get("LinkedIn",[])),
-                "Pages":r.get("Pages Scraped",0),"Time(s)":r.get("Total Time",""),
-                "Source URL":r.get("Source URL",""),
-            })
-        buf = io.StringIO(); pd.DataFrame(rows_csv).to_csv(buf,index=False)
-        st.download_button("Export CSV", buf.getvalue(),
-                           f"mailhunter_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                           "text/csv", key="export_top")
+        xlsx_bytes = build_xlsx(st.session_state.results)
+        st.download_button(
+            "⬇ Export .xlsx",
+            xlsx_bytes,
+            f"mailhunter_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="export_top"
+        )
 st.divider()
 
 left, right = st.columns([1, 2.8], gap="large")
